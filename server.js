@@ -7,9 +7,9 @@
 
 require('dotenv').config();
 const express = require('express');
-const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const cors = require('cors');
 const {
   S3Client,
   GetObjectCommand,
@@ -18,34 +18,25 @@ const {
 } = require('@aws-sdk/client-s3');
 
 const app = express();
+app.use(express.json());
+app.use(cors({ origin: '*', methods: ['GET', 'POST'], allowedHeaders: ['Content-Type', 'Authorization'] }));
 
-/* ---------- CORS (allow web + Capacitor WebView) ---------- */
-app.use(cors({
-  origin: '*', // tighten to your domains in production
-  methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
-}));
-app.options('*', cors());
-
-/* ---------- JSON parsing ---------- */
-app.use(express.json({ limit: '1mb' }));
-
-/* ---------- ENV ---------- */
+// ====== ENV ======
 const {
   PORT = 3000,
   JWT_SECRET = 'dev-secret-change-me',
   WASABI_ACCESS_KEY_ID,
   WASABI_SECRET_ACCESS_KEY,
   WASABI_BUCKET,
-  WASABI_REGION = 'ap-northeast-1',                 // Tokyo
+  WASABI_REGION = 'ap-northeast-1',
   WASABI_ENDPOINT = 'https://s3.ap-northeast-1.wasabisys.com',
 } = process.env;
 
 if (!WASABI_ACCESS_KEY_ID || !WASABI_SECRET_ACCESS_KEY || !WASABI_BUCKET) {
-  console.warn('[WARN] Missing Wasabi env vars: WASABI_ACCESS_KEY_ID, WASABI_SECRET_ACCESS_KEY, WASABI_BUCKET');
+  console.warn('[WARN] Missing Wasabi env vars');
 }
 
-/* ---------- Wasabi client ---------- */
+// ====== Wasabi client ======
 const s3 = new S3Client({
   region: WASABI_REGION,
   endpoint: WASABI_ENDPOINT,
@@ -56,7 +47,7 @@ const s3 = new S3Client({
   },
 });
 
-/* ---------- Consts & helpers ---------- */
+// ====== Helpers ======
 const USERS_KEY = 'users/users.json';
 
 function isValidMobile(m) {
@@ -79,25 +70,11 @@ async function objectExists(Key) {
     return false;
   }
 }
-async function streamToString(stream) {
-  // Node >=18: res.Body is a web stream; fallback to async iterator
-  const chunks = [];
-  for await (const chunk of stream) chunks.push(Buffer.from(chunk));
-  return Buffer.concat(chunks).toString('utf-8');
-}
 async function getObjectText(Key) {
   const res = await s3.send(new GetObjectCommand({ Bucket: WASABI_BUCKET, Key }));
-  return streamToString(res.Body);
-}
-async function writeJson(Key, obj) {
-  const Body = Buffer.from(JSON.stringify(obj, null, 2));
-  await s3.send(new PutObjectCommand({
-    Bucket: WASABI_BUCKET,
-    Key,
-    Body,
-    ContentType: 'application/json',
-    ACL: 'private',
-  }));
+  const chunks = [];
+  for await (const c of res.Body) chunks.push(c);
+  return Buffer.concat(chunks).toString('utf-8');
 }
 async function readUsers() {
   if (!(await objectExists(USERS_KEY))) return { users: [] };
@@ -111,99 +88,76 @@ async function readUsers() {
   }
 }
 async function writeUsers(index) {
-  await writeJson(USERS_KEY, index);
+  const Body = Buffer.from(JSON.stringify(index, null, 2));
+  await s3.send(
+    new PutObjectCommand({
+      Bucket: WASABI_BUCKET,
+      Key: USERS_KEY,
+      Body,
+      ContentType: 'application/json',
+      ACL: 'private',
+    })
+  );
 }
 
-/* ---------- First-run initializer (creates users/users.json if missing) ---------- */
-(async () => {
-  try {
-    const exists = await objectExists(USERS_KEY);
-    if (!exists) {
-      await writeUsers({ users: [] });
-      console.log('Initialized empty users file at', USERS_KEY);
-    }
-  } catch (e) {
-    console.warn('Init users file failed:', e.message);
-  }
-})();
-
-/* ---------- Routes ---------- */
+// ====== Routes ======
 app.get('/', (_req, res) => {
   res.json({ status: 'ok', message: 'Wasabi auth (single users.json)' });
 });
 
-/* ----- SIGNUP -> update users/users.json ----- */
+// SIGNUP -> update users/users.json
 app.post('/signup', async (req, res) => {
   try {
     const { name, mobile, dob, gender, password } = req.body;
 
-    if (!name || !mobile || !dob || !gender || !password) {
+    if (!name || !mobile || !dob || !gender || !password)
       return res.status(400).json({ error: 'name, mobile, dob, gender, password are required' });
-    }
-    if (!isValidMobile(mobile)) {
+    if (!isValidMobile(mobile))
       return res.status(400).json({ error: 'Invalid mobile number format' });
-    }
+
     const age = calcAgeFromDOB(dob);
     if (age === null) return res.status(400).json({ error: 'Invalid dob (use YYYY-MM-DD)' });
     if (age < 18) return res.status(400).json({ error: 'You must be at least 18 years old' });
 
-    // Read-modify-write with basic retry (reduces race risk)
-    const MAX_RETRIES = 5;
-    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-      const idx = await readUsers();
+    const idx = await readUsers();
+    if (idx.users.some((u) => u.mobile === mobile))
+      return res.status(409).json({ error: 'Mobile already registered' });
 
-      if (idx.users.some(u => u.mobile === mobile)) {
-        return res.status(409).json({ error: 'Mobile already registered' });
-      }
+    const passwordHash = await bcrypt.hash(password, 10);
+    idx.users.push({
+      name,
+      mobile,
+      dob,
+      gender,
+      passwordHash,
+      createdAt: new Date().toISOString(),
+    });
 
-      const passwordHash = await bcrypt.hash(password, 10);
-      idx.users.push({
-        name: String(name).trim(),
-        mobile: String(mobile).trim(),
-        dob,
-        gender,
-        passwordHash,
-        createdAt: new Date().toISOString(),
-      });
+    idx.users.sort((a, b) => a.name.localeCompare(b.name));
 
-      // Keep deterministic order
-      idx.users.sort((a, b) => a.name.localeCompare(b.name));
-
-      try {
-        await writeUsers(idx);
-        return res.status(201).json({ message: 'Signup successful' });
-      } catch (e) {
-        // brief backoff then retry
-        await new Promise(r => setTimeout(r, 100 + attempt * 100));
-        if (attempt === MAX_RETRIES) throw e;
-      }
-    }
+    await writeUsers(idx);
+    res.status(201).json({ message: 'Signup successful' });
   } catch (err) {
     console.error('Signup error:', err);
     res.status(500).json({ error: 'Signup failed', details: err.message });
   }
 });
 
-/* ----- LOGIN -> search users.json by mobile ----- */
+// LOGIN -> search users.json by mobile
 app.post('/login', async (req, res) => {
   try {
     const { mobile, password } = req.body;
-    if (!mobile || !password) {
+    if (!mobile || !password)
       return res.status(400).json({ error: 'mobile and password are required' });
-    }
 
     const idx = await readUsers();
-    const user = idx.users.find(u => u.mobile === String(mobile).trim());
+    const user = idx.users.find((u) => u.mobile === mobile);
     if (!user) return res.status(404).json({ error: 'User not found' });
 
     const ok = await bcrypt.compare(password, user.passwordHash);
     if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
 
-    const token = jwt.sign(
-      { sub: user.mobile, name: user.name },
-      JWT_SECRET,
-      { expiresIn: '1h' }
-    );
+    const token = jwt.sign({ sub: user.mobile, name: user.name }, JWT_SECRET, { expiresIn: '1h' });
     res.json({ message: 'Login successful', token });
   } catch (err) {
     console.error('Login error:', err);
@@ -211,12 +165,11 @@ app.post('/login', async (req, res) => {
   }
 });
 
-/* ----- Auth middleware ----- */
+// Auth middleware
 function authenticateJWT(req, res, next) {
   const h = req.headers.authorization;
-  if (!h || !h.startsWith('Bearer ')) {
+  if (!h || !h.startsWith('Bearer '))
     return res.status(401).json({ error: 'Missing token' });
-  }
   try {
     req.user = jwt.verify(h.slice(7), JWT_SECRET);
     next();
@@ -225,11 +178,11 @@ function authenticateJWT(req, res, next) {
   }
 }
 
-/* ----- Profile -> read user by mobile in token ----- */
+// Profile -> read user from users.json by mobile in token
 app.get('/me', authenticateJWT, async (req, res) => {
   try {
     const idx = await readUsers();
-    const user = idx.users.find(u => u.mobile === req.user.sub);
+    const user = idx.users.find((u) => u.mobile === req.user.sub);
     if (!user) return res.status(404).json({ error: 'User not found' });
     const { passwordHash, ...publicUser } = user;
     res.json(publicUser);
@@ -239,12 +192,15 @@ app.get('/me', authenticateJWT, async (req, res) => {
   }
 });
 
-/* ----- Users list (public projection) ----- */
+// Users list (public view)
 app.get('/users', async (_req, res) => {
   try {
     const idx = await readUsers();
     const list = idx.users.map(({ name, mobile, gender, createdAt }) => ({
-      name, mobile, gender, createdAt
+      name,
+      mobile,
+      gender,
+      createdAt,
     }));
     res.json(list);
   } catch (e) {
@@ -252,14 +208,18 @@ app.get('/users', async (_req, res) => {
   }
 });
 
-/* ----- Error handler ----- */
+// ---- Safe fallback for all unknown routes ----
+app.use((req, res) => {
+  res.status(404).json({ error: `Route not found: ${req.originalUrl}` });
+});
+
+// ---- Error handler ----
 app.use((err, _req, res, _next) => {
   console.error('Unhandled error:', err);
   res.status(400).json({ error: err.message || 'Bad Request' });
 });
 
-/* ----- Start ----- */
+// ---- Start ----
 app.listen(PORT, () => {
   console.log(`✅ Wasabi auth running (single users.json) on http://localhost:${PORT}`);
 });
-
